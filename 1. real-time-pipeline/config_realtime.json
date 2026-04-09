@@ -1,0 +1,76 @@
+{
+  "_comment": "Real-time EEG acquisition + inference config",
+
+  "board": {
+    "board_id": 0,
+    "_board_id_note": "0 = CYTON_BOARD. Use -1 for SYNTHETIC_BOARD (testing).",
+    "serial_port": "COM10",
+    "timeout": 0
+  },
+
+  "channel_map": {
+    "_comment": "Maps Cyton physical channel (1-indexed) to EEG electrode location.",
+    "_cyton_note": "Cyton ch N feeds OpenBCI pin N1P through N8P on the bottom header.",
+    "1": "EEG F3-Cz",
+    "2": "EEG Fz-Cz",
+    "3": "EEG F4-Cz",
+    "4": "EEG C3-Cz",
+    "5": "EEG Cz-Cz",
+    "6": "EEG C4-Cz",
+    "7": "EEG P3-Cz",
+    "8": "EEG Pz-Cz",
+    "_note_ch9": "Channel 9 is derived. The model uses 9 channels; ch9 = EEG P4-Cz is set via the Cyton daisy or a second board. If using only 8-ch Cyton, duplicate ch8 or set use_ch9_fallback = true.",
+    "9_fallback": "EEG P4-Cz",
+    "use_ch9_fallback": true,
+    "_fallback_note": "When true, channel 9 is synthesised from ch8 (Pz-Cz). Set false if using a Daisy or external amplifier for P4."
+  },
+
+  "signal": {
+    "fs": 250,
+    "notch_freq": 50.0,
+    "_notch_note": "Change to 60.0 for US power line frequency.",
+    "bandpass_low": 0.5,
+    "bandpass_high": 45.0,
+    "detrend": true
+  },
+
+  "recording": {
+    "window_sec": 10,
+    "_window_note": "Duration of each recording segment fed to the model.",
+    "output_dir": "outputs/recordings",
+    "filename_prefix": "record",
+    "_naming_note": "Files are named record_1.edf, record_2.edf, etc. Counter resets each run unless resume = true.",
+    "resume": false,
+    "max_records": null,
+    "_max_note": "Set to an integer to stop after N recordings. null = run indefinitely."
+  },
+
+  "edf": {
+    "patient_id": "realtime_subject",
+    "recording_id": "realtime_session",
+    "digital_min": -32768,
+    "digital_max": 32767,
+    "physical_min": -500.0,
+    "physical_max": 500.0,
+    "physical_dimension": "uV"
+  },
+
+  "model": {
+    "config_path": "1. real-time-pipeline\\config_combined.json",
+    "_note": "Path to the CombinedEEGHandler config. Relative to repo root or absolute.",
+    "device": "auto"
+  },
+
+  "output": {
+    "results_dir": "outputs/results",
+    "session_json": "outputs/results/session_results.json",
+    "summary_csv": "outputs/results/summary.csv",
+    "log_dir": "outputs/logs"
+  },
+
+  "run": {
+    "verbose": true,
+    "print_per_window": true,
+    "_print_note": "Print stage1/stage2 prediction after each 10-second window."
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "stage1": {
+    "model_name" : "ShallowFBCSPNet",
+    "model_path" : "1. real-time-pipeline\\models\\ShallowFBCSPNet_best_control_vs_ds.pt",
+    "classes"    : {"0": "Control", "1": "DS"}
+  },
+
+  "stage2": {
+    "model_name" : "ShallowFBCSPNet",
+    "model_path" : "1. real-time-pipeline\\models\\ShallowFBCSPNet_best_ds_abnormal.pt",
+    "classes"    : {"0": "Abnormal", "1": "DS"}
+  },
+
+  "signal": {
+    "fs"         : 250,
+    "window_sec" : null,
+    "overlap"    : 0.5,
+    "channels"   : [
+      "EEG F3-Cz", "EEG Fz-Cz", "EEG F4-Cz",
+      "EEG C3-Cz", "EEG Cz-Cz", "EEG C4-Cz",
+      "EEG P3-Cz", "EEG Pz-Cz", "EEG P4-Cz"
+    ]
+  },
+
+  "batch_size" : 32,
+  "device"     : "auto",
+  "output_dir" : "outputs/inference",
+
+  "logging": {
+    "log_to_file" : true,
+    "log_dir"     : "outputs/logs"
+  }
+}
