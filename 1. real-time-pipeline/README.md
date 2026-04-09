@@ -52,9 +52,43 @@ python main.py
 
 # Custom config
 python main.py --config path/to/config_realtime.json
+
+# Session runner with streamed chunk outputs
+python avg_results.py --config path/to/config_realtime.json
 ```
 
 Press **Ctrl-C** to stop cleanly.
+
+## Backend Integration API
+
+The backend is session-oriented and frontend-friendly.
+
+Use `SessionPipeline` from `main.py`:
+
+```python
+from main import SessionPipeline
+
+pipeline = SessionPipeline("1. real-time-pipeline/config_realtime.json")
+
+# 1) Start from frontend Start button
+pipeline.start_session()
+
+# 2) Poll in loop, emit new chunks to websocket/rest
+while True:
+  new_chunks = pipeline.poll_once()  # list of ordered chunk objects
+  for chunk in new_chunks:
+    send_to_frontend(chunk)
+
+# 3) Stop from frontend Stop button
+session_summary = pipeline.stop_session()
+send_to_frontend(session_summary)
+```
+
+Behavior:
+- One start/stop session creates one EDF file.
+- Each 10-second chunk produces one result object in order.
+- Session JSON stores one session object with a `chunk_results` list.
+- Final subject stage is aggregated from all chunk labels.
 
 ---
 
@@ -110,7 +144,7 @@ Metadata stored in each EDF:
 | Field | Value |
 |-------|-------|
 | Fs | 250 Hz |
-| Duration | 10 s (configurable) |
+| Duration | Full session length (N chunks × window_sec) |
 | Channels | 9 × Cz-referenced labels |
 | Physical unit | µV |
 | Physical range | −500 to +500 µV |
@@ -118,25 +152,39 @@ Metadata stored in each EDF:
 
 ### `outputs/results/session_results.json`
 
-Grows incrementally — one JSON object per window:
+Grows incrementally — one JSON object per session:
 
 ```json
 [
   {
-    "record_index":        1,
-    "timestamp":           "2025-04-09T14:23:01",
-    "edf_path":            "outputs/recordings/record_1.edf",
-    "subject_id":          "record_1",
-    "final_label":         "DS",
-    "n_windows":           10,
-    "stage1_prediction":   "DS",
-    "stage1_confidence":   0.87,
-    "stage1_votes":        {"DS": 8, "Control": 2},
-    "stage1_mean_probs":   {"DS": 0.87, "Control": 0.13},
-    "stage2_prediction":   "DS",
-    "stage2_confidence":   0.91,
-    "stage2_votes":        {"DS": 9, "Abnormal": 1},
-    "stage2_mean_probs":   {"DS": 0.91, "Abnormal": 0.09}
+    "session_id": "record_1.edf",
+    "record_index": 1,
+    "subject_id": "record_1.edf",
+    "edf_path": "outputs/recordings/record_1.edf",
+    "started_at": "2026-04-09T22:30:00",
+    "ended_at": "2026-04-09T22:33:20",
+    "total_chunks": 20,
+    "final_subject_stage": "Control (Non-DS)",
+    "final_votes": {"Control (Non-DS)": 15, "DS": 5},
+    "avg_stage1_mean_probs": {"DS": 0.31, "Control": 0.69},
+    "avg_stage2_mean_probs": {"DS": 0.42, "Abnormal": 0.58},
+    "chunk_results": [
+      {
+        "chunk_index": 1,
+        "subject_id": "record_1.edf",
+        "final_label": "Control (Non-DS)",
+        "n_windows": 1,
+        "stage1_prediction": "Control",
+        "stage1_confidence": 0.9997,
+        "stage1_votes": {"DS": 0, "Control": 1},
+        "stage1_mean_probs": {"DS": 0.0003, "Control": 0.9997},
+        "stage2_prediction": null,
+        "stage2_confidence": null,
+        "stage2_votes": null,
+        "stage2_mean_probs": null,
+        "timestamp": "2026-04-09T22:30:10"
+      }
+    ]
   },
   …
 ]

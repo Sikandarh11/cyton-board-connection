@@ -1,30 +1,14 @@
-"""
-main.py
-=======
-Real-time EEG acquisition + two-stage inference pipeline.
+"""Session-oriented EEG backend.
 
-Loop
-----
-    1.  BoardInterface streams data continuously.
-    2.  Recorder accumulates samples into a 10-second buffer.
-    3.  When a full window is ready:
-        a.  EDFWriter saves the raw window to record_N.edf
-        b.  Preprocessor applies detrend / notch / bandpass
-        c.  InferenceEngine runs CombinedEEGHandler on the clean window
-        d.  ResultStore appends and flushes results to JSON + CSV
-    4.  Repeat until KeyboardInterrupt or max_records reached.
-
-Run
----
-    python main.py                           # uses config_realtime.json
-    python main.py --config my_config.json   # custom config path
+One start/stop session writes one EDF file while still emitting chunk-by-chunk
+inference results in sequence.
 """
 
 import argparse
 import json
 import os
 import time
-import sys
+from datetime import datetime
 
 import numpy as np
 
@@ -51,110 +35,188 @@ def load_config(path: str) -> dict:
 # Main pipeline
 # ──────────────────────────────────────────────────────────────────────
 
-def run(config_path: str) -> None:
-    cfg = load_config(config_path)
+class SessionPipeline:
+    """Backend-friendly session controller.
 
-    verbose          = cfg["run"].get("verbose", True)
-    print_per_window = cfg["run"].get("print_per_window", True)
-    max_records      = cfg["recording"].get("max_records", None)
-    resume           = cfg["recording"].get("resume", False)
+    Integration flow:
+    1) start_session()
+    2) call poll_once() in a loop (or run_until_stopped())
+    3) stop_session()
+    """
 
-    # ── Initialise modules ────────────────────────────────────────────
-    board     = BoardInterface(cfg["board"])
-    recorder  = Recorder(cfg["channel_map"], cfg["signal"], cfg["recording"])
-    preproc   = Preprocessor(cfg["signal"])
-    writer    = EDFWriter(
-        cfg["recording"], cfg["edf"], cfg["signal"],
-        channel_names=recorder.channel_names,
-    )
-    engine    = InferenceEngine(cfg["model"])
-    store     = ResultStore(cfg["output"])
+    def __init__(self, config_path: str):
+        self._cfg = load_config(config_path)
 
-    # Determine starting record index
-    record_idx = EDFWriter.load_counter(
-        cfg["recording"]["output_dir"],
-        cfg["recording"].get("filename_prefix", "record"),
-        resume,
-    )
+        self._verbose = self._cfg["run"].get("verbose", True)
+        self._print_per_window = self._cfg["run"].get("print_per_window", True)
+        self._resume = self._cfg["recording"].get("resume", False)
 
-    fs          = board.sampling_rate           # from board object
-    chunk_size  = max(1, fs // 10)             # pull ~100 ms at a time
-    window_sec  = cfg["recording"]["window_sec"]
+        self._board = BoardInterface(self._cfg["board"])
+        self._recorder = Recorder(self._cfg["channel_map"], self._cfg["signal"], self._cfg["recording"])
+        self._preproc = Preprocessor(self._cfg["signal"])
+        self._writer = EDFWriter(
+            self._cfg["recording"],
+            self._cfg["edf"],
+            self._cfg["signal"],
+            channel_names=self._recorder.channel_names,
+        )
+        self._engine = InferenceEngine(self._cfg["model"])
+        self._store = ResultStore(self._cfg["output"])
 
-    if verbose:
-        print("\n" + "═" * 52)
-        print("  Real-time EEG Pipeline")
-        print(f"  Fs={fs} Hz  |  window={window_sec} s  |  record prefix='"
-              f"{cfg['recording'].get('filename_prefix','record')}'")
-        print(f"  Channels: {recorder.channel_names}")
-        print("  Press Ctrl-C to stop.")
-        print("═" * 52 + "\n")
+        self._record_idx = EDFWriter.load_counter(
+            self._cfg["recording"]["output_dir"],
+            self._cfg["recording"].get("filename_prefix", "record"),
+            self._resume,
+        )
 
-    # ── Main loop ─────────────────────────────────────────────────────
-    try:
-        board.connect()
+        self._chunk_size = max(1, self._board.sampling_rate // 10)
+        self._window_sec = self._cfg["recording"]["window_sec"]
 
-        # Brief warm-up so BrainFlow ring buffer fills
-        print("[main] Warming up (2 s) ...")
+        self._session_active = False
+        self._session_started_at = None
+        self._session_subject_id = None
+        self._session_chunks = []
+        self._session_raw_windows = []
+
+    def start_session(self) -> dict:
+        if self._session_active:
+            raise RuntimeError("Session is already active.")
+
+        # Ensure every session starts with an empty recording buffer.
+        self._recorder = Recorder(self._cfg["channel_map"], self._cfg["signal"], self._cfg["recording"])
+
+        prefix = self._cfg["recording"].get("filename_prefix", "record")
+        self._session_subject_id = f"{prefix}_{self._record_idx}.edf"
+        self._session_chunks = []
+        self._session_raw_windows = []
+        self._session_started_at = datetime.now().isoformat(timespec="seconds")
+
+        self._board.connect()
+        if self._verbose:
+            print("[main] Warming up (2 s) ...")
         time.sleep(2)
 
-        while True:
-            # 1. Read a small chunk from the board
-            raw_chunk = board.read(chunk_size)   # (n_raw_channels, chunk_size)
+        self._session_active = True
+        return {
+            "session_id": self._session_subject_id,
+            "window_sec": self._window_sec,
+            "sampling_rate": self._board.sampling_rate,
+            "status": "started",
+        }
 
-            # 2. Push into recorder
-            recorder.push(raw_chunk)
+    def poll_once(self) -> list:
+        if not self._session_active:
+            raise RuntimeError("No active session. Call start_session() first.")
 
-            # 3. Check if a full 10-second window is ready
-            if not recorder.window_ready():
-                time.sleep(0.01)  # yield CPU
-                continue
+        emitted = []
+        raw_chunk = self._board.read(self._chunk_size)
+        self._recorder.push(raw_chunk)
 
-            window_raw = recorder.pop_window()   # (9, window_samples) float32
+        while self._recorder.window_ready():
+            window_raw = self._recorder.pop_window()
+            self._session_raw_windows.append(window_raw)
 
-            if verbose:
-                print(f"\n[main] Window ready — record #{record_idx}")
+            window_clean = self._preproc.process(window_raw)
+            result = self._engine.predict(window_clean, subject_id=self._session_subject_id)
 
-            # 4a. Save raw EDF
-            edf_path = writer.save(window_raw, record_index=record_idx)
-            if verbose:
-                print(f"[main] EDF saved -> {edf_path}")
+            chunk_idx = len(self._session_chunks) + 1
+            chunk_entry = self._build_chunk_entry(result, chunk_idx)
+            self._session_chunks.append(chunk_entry)
+            emitted.append(chunk_entry)
 
-            # 4b. Preprocess
-            window_clean = preproc.process(window_raw)  # (9, window_samples)
+            if self._print_per_window:
+                print(f"[main] chunk#{chunk_idx} -> {chunk_entry['final_label']}")
 
-            # 4c. Inference
-            subject_id = f"{cfg['recording'].get('filename_prefix','record')}_{record_idx}"
-            result = engine.predict(window_clean, subject_id=subject_id)
+        return emitted
 
-            # 4d. Store results
-            store.append(result, record_index=record_idx, edf_path=edf_path)
-            store.flush()
+    def stop_session(self) -> dict:
+        if not self._session_active:
+            raise RuntimeError("No active session to stop.")
 
-            if print_per_window:
-                store.print_latest()
+        ended_at = datetime.now().isoformat(timespec="seconds")
 
-            # Persist counter
-            record_idx += 1
-            EDFWriter.save_counter(
-                cfg["recording"]["output_dir"],
-                cfg["recording"].get("filename_prefix", "record"),
-                record_idx,
-            )
+        try:
+            self._board.disconnect()
+        finally:
+            self._session_active = False
 
-            # Stop condition
-            if max_records is not None and record_idx > max_records:
-                print(f"[main] Reached max_records={max_records}. Stopping.")
-                break
+        if not self._session_raw_windows:
+            session_summary = {
+                "session_id": self._session_subject_id,
+                "started_at": self._session_started_at,
+                "ended_at": ended_at,
+                "total_chunks": 0,
+                "chunk_results": [],
+                "final_subject_stage": None,
+                "status": "stopped_no_data",
+            }
+            self._store.append_session(session_summary)
+            self._store.flush()
+            return session_summary
 
-    except KeyboardInterrupt:
-        print("\n[main] Interrupted by user.")
+        session_raw = np.concatenate(self._session_raw_windows, axis=1)
+        edf_path = self._writer.save(session_raw, record_index=self._record_idx)
 
-    finally:
-        board.disconnect()
-        print(f"\n[main] Session complete. {record_idx - 1} windows recorded.")
-        print(f"[main] Results -> {cfg['output']['session_json']}")
-        print(f"[main] Summary -> {cfg['output']['summary_csv']}")
+        session_summary = self._store.build_session_summary(
+            session_id=self._session_subject_id,
+            record_index=self._record_idx,
+            edf_path=edf_path,
+            started_at=self._session_started_at,
+            ended_at=ended_at,
+            chunk_results=self._session_chunks,
+        )
+
+        self._store.append_session(session_summary)
+        self._store.flush()
+
+        self._record_idx += 1
+        EDFWriter.save_counter(
+            self._cfg["recording"]["output_dir"],
+            self._cfg["recording"].get("filename_prefix", "record"),
+            self._record_idx,
+        )
+
+        if self._verbose:
+            print(f"[main] Saved session EDF -> {edf_path}")
+            print(f"[main] Final subject stage -> {session_summary['final_subject_stage']}")
+
+        return session_summary
+
+    def run_until_stopped(self) -> dict:
+        self.start_session()
+        try:
+            while True:
+                self.poll_once()
+                time.sleep(0.01)
+        except KeyboardInterrupt:
+            print("\n[main] Interrupted by user.")
+        return self.stop_session()
+
+    @staticmethod
+    def _build_chunk_entry(result: dict, chunk_index: int) -> dict:
+        return {
+            "chunk_index": chunk_index,
+            "subject_id": result.get("subject_id"),
+            "final_label": result.get("final_label"),
+            "n_windows": result.get("n_windows"),
+            "stage1_prediction": result.get("stage1_prediction"),
+            "stage1_confidence": result.get("stage1_confidence"),
+            "stage1_votes": result.get("stage1_votes"),
+            "stage1_mean_probs": result.get("stage1_mean_probs"),
+            "stage2_prediction": result.get("stage2_prediction"),
+            "stage2_confidence": result.get("stage2_confidence"),
+            "stage2_votes": result.get("stage2_votes"),
+            "stage2_mean_probs": result.get("stage2_mean_probs"),
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+
+
+def run(config_path: str) -> None:
+    pipeline = SessionPipeline(config_path)
+    summary = pipeline.run_until_stopped()
+    print(f"[main] Session chunks: {summary.get('total_chunks', 0)}")
+    print(f"[main] Results -> {pipeline._cfg['output']['session_json']}")
+    print(f"[main] Summary -> {pipeline._cfg['output']['summary_csv']}")
 
 
 # ──────────────────────────────────────────────────────────────────────

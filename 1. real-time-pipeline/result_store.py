@@ -1,69 +1,30 @@
-"""
-result_store.py
-===============
-Persists inference results:
+"""Session-level result persistence.
 
-1. **Session JSON** (``outputs/results/session_results.json``)
-   Grows incrementally — one entry per 10-second window.
-   Reload-safe: if the file already exists it is extended, not overwritten.
-
-2. **Summary CSV** (``outputs/results/summary.csv``)
-   One row per recording, flat columns, easy to open in Excel / pandas.
-
-Result dict schema (written verbatim, minus the ``window_results`` DataFrame)
---------------
-{
-    "record_index"      : int,       # 1-based recording counter
-    "edf_path"          : str,       # path to the saved EDF
-    "subject_id"        : str,
-    "final_label"       : str,
-    "n_windows"         : int,
-    "stage1_prediction" : str,
-    "stage1_confidence" : float,
-    "stage1_votes"      : dict,
-    "stage1_mean_probs" : dict,
-    "stage2_prediction" : str | None,
-    "stage2_confidence" : float | None,
-    "stage2_votes"      : dict | None,
-    "stage2_mean_probs" : dict | None,
-}
-
-Usage
------
-    from result_store import ResultStore
-    store = ResultStore(cfg["output"])
-
-    store.append(result, record_index=1, edf_path="/path/record_1.edf")
-    store.flush()   # write session JSON and summary CSV to disk
+Stores one JSON object per start/stop session. Each session object contains:
+- one EDF path for the full session
+- sequential chunk-level predictions
+- final subject stage aggregation across all chunks
 """
 
 import os
 import json
 import csv
 from datetime import datetime
-from copy import deepcopy
+from collections import Counter
 
 
 # CSV columns in display order
 _CSV_COLUMNS = [
     "record_index",
-    "timestamp",
+    "session_id",
+    "started_at",
+    "ended_at",
     "edf_path",
-    "subject_id",
-    "final_label",
-    "n_windows",
-    "stage1_prediction",
-    "stage1_confidence",
-    "stage2_prediction",
-    "stage2_confidence",
-    "stage1_votes_DS",
-    "stage1_votes_Control",
-    "stage2_votes_DS",
-    "stage2_votes_Abnormal",
-    "stage1_prob_DS",
-    "stage1_prob_Control",
-    "stage2_prob_DS",
-    "stage2_prob_Abnormal",
+    "total_chunks",
+    "final_subject_stage",
+    "final_votes_json",
+    "avg_stage1_mean_probs_json",
+    "avg_stage2_mean_probs_json",
 ]
 
 
@@ -75,61 +36,91 @@ class ResultStore:
         os.makedirs(os.path.dirname(self._json_path), exist_ok=True)
         os.makedirs(os.path.dirname(self._csv_path),  exist_ok=True)
 
-        # In-memory list of result dicts (grows each window)
-        self._records: list = []
+        self._sessions = []
 
         # Load existing session if file already exists (resume mode)
         if os.path.exists(self._json_path):
             try:
                 with open(self._json_path) as fh:
-                    self._records = json.load(fh)
-                print(f"[ResultStore] Resumed — {len(self._records)} existing records loaded.")
+                    data = json.load(fh)
+                self._sessions = data if isinstance(data, list) else []
+                print(f"[ResultStore] Resumed — {len(self._sessions)} existing sessions loaded.")
             except Exception:
-                self._records = []
+                self._sessions = []
 
     # ------------------------------------------------------------------
     # Public
     # ------------------------------------------------------------------
 
-    def append(self, result: dict, record_index: int, edf_path: str) -> None:
-        """
-        Add one inference result to the in-memory store.
+    def append_session(self, session_summary: dict) -> None:
+        self._sessions.append(session_summary)
 
-        Parameters
-        ----------
-        result       : dict from InferenceEngine.predict()
-        record_index : 1-based counter
-        edf_path     : path to the corresponding .edf file
-        """
-        # Drop the DataFrame — not JSON-serialisable
-        entry = {k: v for k, v in result.items() if k != "window_results"}
-        entry["record_index"] = record_index
-        entry["edf_path"]     = edf_path
-        entry["timestamp"]    = datetime.now().isoformat(timespec="seconds")
-        self._records.append(entry)
+    def build_session_summary(
+        self,
+        session_id: str,
+        record_index: int,
+        edf_path: str,
+        started_at: str,
+        ended_at: str,
+        chunk_results: list,
+    ) -> dict:
+        votes = Counter()
+        stage1_prob_keys = ["DS", "Control"]
+        stage2_prob_keys = ["DS", "Abnormal"]
+
+        stage1_sums = {k: 0.0 for k in stage1_prob_keys}
+        stage2_sums = {k: 0.0 for k in stage2_prob_keys}
+        stage2_count = 0
+
+        for chunk in chunk_results:
+            label = chunk.get("final_label")
+            if label:
+                votes[label] += 1
+
+            s1_probs = chunk.get("stage1_mean_probs") or {}
+            for key in stage1_prob_keys:
+                stage1_sums[key] += float(s1_probs.get(key, 0.0))
+
+            s2_probs = chunk.get("stage2_mean_probs") or {}
+            if s2_probs:
+                stage2_count += 1
+                for key in stage2_prob_keys:
+                    stage2_sums[key] += float(s2_probs.get(key, 0.0))
+
+        n_chunks = len(chunk_results)
+        avg_stage1 = {
+            key: round(stage1_sums[key] / n_chunks, 4) if n_chunks else None
+            for key in stage1_prob_keys
+        }
+        avg_stage2 = {
+            key: round(stage2_sums[key] / stage2_count, 4) if stage2_count else None
+            for key in stage2_prob_keys
+        }
+
+        final_subject_stage = None
+        if votes:
+            final_subject_stage = votes.most_common(1)[0][0]
+
+        return {
+            "session_id": session_id,
+            "subject_id": os.path.basename(edf_path),
+            "record_index": record_index,
+            "edf_path": edf_path,
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "total_chunks": n_chunks,
+            "chunk_results": chunk_results,
+            "final_subject_stage": final_subject_stage,
+            "final_votes": dict(votes),
+            "avg_stage1_mean_probs": avg_stage1,
+            "avg_stage2_mean_probs": avg_stage2,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
 
     def flush(self) -> None:
         """Write / overwrite both the JSON and CSV files."""
         self._write_json()
         self._write_csv()
-
-    def print_latest(self) -> None:
-        """Pretty-print the most recent result to stdout."""
-        if not self._records:
-            return
-        r = self._records[-1]
-        print("\n" + "─" * 52)
-        print(f"  Record #{r['record_index']}  ->  {r['final_label']}")
-        print(f"  Stage 1 : {r['stage1_prediction']}"
-              f"  (conf={r['stage1_confidence']:.2f})"
-              f"  votes={r['stage1_votes']}")
-        s2p = r.get("stage2_prediction")
-        if s2p:
-            print(f"  Stage 2 : {s2p}"
-                  f"  (conf={r['stage2_confidence']:.2f})"
-                  f"  votes={r['stage2_votes']}")
-        print(f"  EDF     : {r['edf_path']}")
-        print("─" * 52 + "\n")
 
     # ------------------------------------------------------------------
     # Internal
@@ -137,32 +128,23 @@ class ResultStore:
 
     def _write_json(self) -> None:
         with open(self._json_path, "w") as fh:
-            json.dump(self._records, fh, indent=2, default=str)
+            json.dump(self._sessions, fh, indent=2, default=str)
 
     def _write_csv(self) -> None:
-        write_header = not os.path.exists(self._csv_path) or len(self._records) == 1
         with open(self._csv_path, "w", newline="") as fh:
             writer = csv.DictWriter(fh, fieldnames=_CSV_COLUMNS, extrasaction="ignore")
             writer.writeheader()
-            for r in self._records:
+            for r in self._sessions:
                 row = {
-                    "record_index"        : r.get("record_index"),
-                    "timestamp"           : r.get("timestamp"),
-                    "edf_path"            : r.get("edf_path"),
-                    "subject_id"          : r.get("subject_id"),
-                    "final_label"         : r.get("final_label"),
-                    "n_windows"           : r.get("n_windows"),
-                    "stage1_prediction"   : r.get("stage1_prediction"),
-                    "stage1_confidence"   : r.get("stage1_confidence"),
-                    "stage2_prediction"   : r.get("stage2_prediction"),
-                    "stage2_confidence"   : r.get("stage2_confidence"),
-                    "stage1_votes_DS"     : (r.get("stage1_votes") or {}).get("DS"),
-                    "stage1_votes_Control": (r.get("stage1_votes") or {}).get("Control"),
-                    "stage2_votes_DS"     : (r.get("stage2_votes") or {}).get("DS"),
-                    "stage2_votes_Abnormal": (r.get("stage2_votes") or {}).get("Abnormal"),
-                    "stage1_prob_DS"      : (r.get("stage1_mean_probs") or {}).get("DS"),
-                    "stage1_prob_Control" : (r.get("stage1_mean_probs") or {}).get("Control"),
-                    "stage2_prob_DS"      : (r.get("stage2_mean_probs") or {}).get("DS"),
-                    "stage2_prob_Abnormal": (r.get("stage2_mean_probs") or {}).get("Abnormal"),
+                    "record_index": r.get("record_index"),
+                    "session_id": r.get("session_id"),
+                    "started_at": r.get("started_at"),
+                    "ended_at": r.get("ended_at"),
+                    "edf_path": r.get("edf_path"),
+                    "total_chunks": r.get("total_chunks"),
+                    "final_subject_stage": r.get("final_subject_stage"),
+                    "final_votes_json": json.dumps(r.get("final_votes") or {}),
+                    "avg_stage1_mean_probs_json": json.dumps(r.get("avg_stage1_mean_probs") or {}),
+                    "avg_stage2_mean_probs_json": json.dumps(r.get("avg_stage2_mean_probs") or {}),
                 }
                 writer.writerow(row)
