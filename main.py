@@ -19,7 +19,7 @@ class EEGVisualizationWithFFT:
         self.num_channels = len(self.eeg_channels)
 
         # Data buffer settings
-        self.window_size = 5  # seconds
+        self.window_size = 10  # seconds
         self.max_points = int(self.sampling_rate * self.window_size)
 
         # Initialize deques for each channel
