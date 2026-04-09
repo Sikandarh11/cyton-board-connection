@@ -1,0 +1,17 @@
+# Core scientific stack
+numpy>=1.24
+pandas>=1.5
+scikit-learn>=1.2
+
+# EEG + acquisition
+brainflow>=5.13
+pyEDFlib>=0.1.36
+mne>=1.5
+
+# Model inference (CPU)
+torch>=2.2
+braindecode>=0.8
+
+# Utility scripts in 2. checks/
+pyserial>=3.5
+matplotlib>=3.7
